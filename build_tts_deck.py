@@ -93,8 +93,8 @@ OUTPUT_DIR = "./tts_output"       # where sheet PNGs + the save JSON get written
 
 # Leave these blank ("") to get placeholder URLs you fill in by hand later,
 # or set them once you know where the output images will be hosted.
-FACE_URL_BASE = ""                # e.g. "https://raw.githubusercontent.com/you/repo/main/faces"
-BACK_URL_BASE = ""                # e.g. "https://raw.githubusercontent.com/you/repo/main/backs"
+FACE_URL_BASE = "https://raw.githubusercontent.com/BluMasc/wildward_stuff/refs/heads/main/tts_output"                # e.g. "https://raw.githubusercontent.com/you/repo/main/faces"
+BACK_URL_BASE = "https://raw.githubusercontent.com/BluMasc/wildward_stuff/refs/heads/main/images/cardbacks"                # e.g. "https://raw.githubusercontent.com/you/repo/main/backs"
 
 # Build the 5 self-refilling draft bags (Monster + Faction-H/T/R/C) for
 # pre-game deckbuilding? True/False.
