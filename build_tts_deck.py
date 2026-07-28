@@ -88,7 +88,7 @@ from PIL import Image
 
 CSV_PATH = "out.csv"              # path to the card data CSV
 IMAGES_DIR = "./../../Images"       # folder of face images (named by card Name, or number)
-BACKS_DIR = "./cardbacks"        # folder of back images (Monster.png, Expedition.png, etc.)
+BACKS_DIR = "./images/cardbacks"        # folder of back images (Monster.png, Expedition.png, etc.)
 OUTPUT_DIR = "./tts_output"       # where sheet PNGs + the save JSON get written
 
 # Leave these blank ("") to get placeholder URLs you fill in by hand later,
@@ -105,28 +105,102 @@ DRAFT_BAGS = True
 # the deck. Works for ANY card in the whole CSV, not just Expedition.
 DECK_BUILDER = True
 
+# Your card art's real pixel size. Retainer/Event/Tool/Biome/Hero cards are
+# portrait; Monster cards are the same total canvas but landscape (W/H
+# swapped). Used both to size the sprite-sheet cells correctly (so
+# landscape art doesn't get squished into a portrait cell) and to convert
+# your MSE stat-field pixel positions into TTS counter offsets.
+PORTRAIT_IMG_W, PORTRAIT_IMG_H = 744, 1039
+LANDSCAPE_IMG_W, LANDSCAPE_IMG_H = 1039, 744
+ 
+# If counters land mirrored (wrong side/corner) when you test in TTS, flip
+# these and re-run -- much faster than redoing the pixel math.
+MIRROR_X = False
+MIRROR_Z = False
+ 
 # =============================================================================
-
+ 
 GRID_COLS = 10
 GRID_ROWS = 7
 PER_SHEET = GRID_COLS * GRID_ROWS  # 70, the classic safe TTS limit
-CARD_W = 744
-CARD_H = 1039
-
+ 
+# Per-cell pixel size for the sprite sheets, capped so a full 10x7 sheet
+# stays under TTS's recommended max texture size (4096px/side) while
+# preserving each shape's real aspect ratio.
+_MAX_SHEET_DIM = 4096
+_CELL_W_CAP = _MAX_SHEET_DIM // GRID_COLS
+ 
+ 
+def _cell_size(img_w, img_h):
+    w = _CELL_W_CAP
+    h = round(w * img_h / img_w)
+    return w, h
+ 
+ 
+PORTRAIT_CARD_W, PORTRAIT_CARD_H = _cell_size(PORTRAIT_IMG_W, PORTRAIT_IMG_H)
+LANDSCAPE_CARD_W, LANDSCAPE_CARD_H = _cell_size(LANDSCAPE_IMG_W, LANDSCAPE_IMG_H)
+ 
+# Physical TTS card size when the model's built from a sheet cell of a given
+# aspect ratio -- standard poker ratio (2.5 x 3.5) for portrait, swapped for
+# landscape. Used only for the counter-offset math below.
+PHYS_PORTRAIT_W, PHYS_PORTRAIT_L = 2.5, 3.5
+PHYS_LANDSCAPE_W, PHYS_LANDSCAPE_L = 3.5, 2.5
+ 
 PLACEHOLDER_FACE_URL = "REPLACE_ME_FACE_SHEET_URL"
 PLACEHOLDER_BACK_URL = "REPLACE_ME_BACK_URL"
-
+ 
 EXPEDITION_TYPES = {"Retainer", "Event", "Tool", "Disposable Tool", "Biome"}
 FACTIONS = ("H", "T", "R", "C")
-
+ 
 ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|,\']')
-
-
+ 
+ 
+def cell_size_for_group(group_key):
+    """Monster cards are landscape; every other back-group is portrait."""
+    if group_key == "Monster":
+        return LANDSCAPE_CARD_W, LANDSCAPE_CARD_H
+    return PORTRAIT_CARD_W, PORTRAIT_CARD_H
+ 
+ 
+def _stat_offset(left, top, w, h, canvas_w, canvas_h, phys_w, phys_l):
+    """Convert an MSE field's pixel bounding box into a TTS world-space
+    (dx, dz) offset from the card's center, given the physical card size
+    implied by its aspect ratio."""
+    cx, cy = left + w / 2, top + h / 2
+    fx, fy = cx / canvas_w, cy / canvas_h
+    dx = (fx - 0.5) * phys_w
+    dz = (0.5 - fy) * phys_l
+    if MIRROR_X:
+        dx = -dx
+    if MIRROR_Z:
+        dz = -dz
+    return round(dx, 4), round(dz, 4)
+ 
+ 
+# MSE field positions (left, top, width, height), in the order given.
+_MONSTER_STAT_FIELDS = [
+    ("Health", 275, 215, 270, 45),
+    ("Suspicion", 275, 265, 270, 45),
+    ("Mystery", 275, 315, 270, 45),
+    ("Stability", 275, 365, 270, 45),
+]
+_RETAINER_STAT_FIELD = ("Stamina", 295, 884, 166, 68)
+ 
+MONSTER_STAT_OFFSETS = [
+    (name, *_stat_offset(left, top, w, h, LANDSCAPE_IMG_W, LANDSCAPE_IMG_H,
+                          PHYS_LANDSCAPE_W, PHYS_LANDSCAPE_L))
+    for name, left, top, w, h in _MONSTER_STAT_FIELDS
+]
+RETAINER_STAT_OFFSET = _stat_offset(
+    _RETAINER_STAT_FIELD[1], _RETAINER_STAT_FIELD[2], _RETAINER_STAT_FIELD[3], _RETAINER_STAT_FIELD[4],
+    PORTRAIT_IMG_W, PORTRAIT_IMG_H, PHYS_PORTRAIT_W, PHYS_PORTRAIT_L)
+ 
+ 
 def parse_number(num_field):
     m = re.match(r"\s*(\d+)\s*/\s*\d+\s*", num_field or "")
     return int(m.group(1)) if m else None
-
-
+ 
+ 
 def normalize_name(s):
     """Normalize a card name / filename stem so MSE-exported filenames
     reliably match CSV names despite minor sanitization differences."""
@@ -134,8 +208,8 @@ def normalize_name(s):
     s = ILLEGAL_FILENAME_CHARS.sub("", s)
     s = re.sub(r"\s+", " ", s)
     return s.lower()
-
-
+ 
+ 
 def get_back_group(row):
     """Wildward-specific grouping. Edit this to match your own game's rules."""
     t = row.get("Type", "") or ""
@@ -147,12 +221,12 @@ def get_back_group(row):
             return f"Hero-{faction}"
         return "Hero-None"
     return "Expedition"  # Retainer, Event, Tool, Disposable Tool, Biome
-
-
+ 
+ 
 def is_expedition(row):
     return (row.get("Type", "") or "") in EXPEDITION_TYPES
-
-
+ 
+ 
 def load_csv(csv_path):
     with open(csv_path, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f, delimiter=";"))
@@ -166,8 +240,8 @@ def load_csv(csv_path):
     rows = [r for r in rows if r["_num"] is not None]
     rows.sort(key=lambda r: r["_num"])
     return rows
-
-
+ 
+ 
 def build_image_index(images_dir):
     """Maps normalized filename stem -> path, for every image file in the
     folder. Used to match MSE's name-based exports."""
@@ -176,59 +250,55 @@ def build_image_index(images_dir):
         if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
             index[normalize_name(p.stem)] = p
     return index
-
-
+ 
+ 
 def find_image_by_stem(folder, stem):
     for ext in (".png", ".jpg", ".jpeg", ".webp"):
         p = folder / f"{stem}{ext}"
         if p.exists():
             return p
     return None
-
-
+ 
+ 
 def resolve_face_image(row, images_dir, image_index):
     """Try matching by card name first (MSE export convention), then fall
     back to matching by card number (older convention)."""
     key = normalize_name(row.get("Name", ""))
     if key in image_index:
         return image_index[key]
-    else:
-        print(f"WARNING: No file named {key}")
     return find_image_by_stem(images_dir, row["_num"])
-
-
+ 
+ 
 def build_face_sheets(rows, images_dir, image_index, output_dir, group_key):
-    """Build 10x7 face sheets for one back-group's rows."""
+    """Build 10x7 face sheets for one back-group's rows, using that
+    group's own cell size (landscape for Monster, portrait for everything
+    else) so the art isn't stretched into the wrong aspect ratio."""
+    cell_w, cell_h = cell_size_for_group(group_key)
     sheets = []
-    width = CARD_W
-    height = CARD_H
-    if group_key=="Monster":
-        width = CARD_H
-        height = CARD_W
     n_sheets = math.ceil(len(rows) / PER_SHEET)
     for sheet_idx in range(n_sheets):
         chunk = rows[sheet_idx * PER_SHEET:(sheet_idx + 1) * PER_SHEET]
-        sheet_img = Image.new("RGBA", (width * GRID_COLS, height * GRID_ROWS), (0, 0, 0, 0))
+        sheet_img = Image.new("RGBA", (cell_w * GRID_COLS, cell_h * GRID_ROWS), (0, 0, 0, 0))
         for i, row in enumerate(chunk):
             col, grow = i % GRID_COLS, i // GRID_COLS
             img_path = resolve_face_image(row, images_dir, image_index)
             if img_path is None:
-                print(f"WARNING: no face image for '{img_path}' "
+                print(f"WARNING: no face image for '{row.get('Name')}' "
                       f"(#{row['_num']}), leaving blank cell", file=sys.stderr)
             else:
                 try:
-                    card_img = Image.open(img_path).convert("RGBA").resize((width, height))
-                    sheet_img.paste(card_img, (col * width, grow * height), card_img)
+                    card_img = Image.open(img_path).convert("RGBA").resize((cell_w, cell_h))
+                    sheet_img.paste(card_img, (col * cell_w, grow * cell_h), card_img)
                 except Exception as e:
                     print(f"WARNING: failed to load {img_path}: {e}", file=sys.stderr)
         safe_group = group_key.replace(" ", "_")
         out_path = output_dir / f"sheet_faces_{safe_group}_{sheet_idx + 1}.png"
         sheet_img.save(out_path)
         sheets.append({"path": out_path, "rows": chunk, "group": group_key, "sheet_num": sheet_idx + 1})
-        print(f"Wrote {out_path} ({len(chunk)} cards, group={group_key})")
+        print(f"Wrote {out_path} ({len(chunk)} cards, group={group_key}, cell={cell_w}x{cell_h})")
     return sheets
-
-
+ 
+ 
 def card_description(row):
     desc_parts = []
     if row.get("Wincon"):
@@ -239,8 +309,8 @@ def card_description(row):
         if row.get(stat):
             desc_parts.append(f"{stat}: {row[stat]}")
     return "\n".join(desc_parts)
-
-
+ 
+ 
 def counter_kind(row):
     """Which counter-button script (if any) a card should get, based on
     its type. Only Monster (4 stats) and Retainer (1 Stamina) have real
@@ -250,15 +320,15 @@ def counter_kind(row):
     if (row.get("Type", "") or "") == "Retainer":
         return "Retainer"
     return None
-
-
+ 
+ 
 # Both scripts parse their OWN stat values out of the card's Description
 # field at click time (card_description() already writes lines like
 # "Health: 7"), so the same static script text works for every card of a
 # given kind -- no per-card script generation needed.
-
-MONSTER_COUNTER_SCRIPT = """local COUNTERS_ADDED = false
-
+ 
+MONSTER_COUNTER_SCRIPT_TEMPLATE = """local COUNTERS_ADDED = false
+ 
 function onLoad()
     self.createButton({
         click_function = "addCounters",
@@ -272,7 +342,7 @@ function onLoad()
         font_color = {1, 1, 1},
     })
 end
-
+ 
 function addCounters(obj, color, alt_click)
     if COUNTERS_ADDED then
         broadcastToColor("Counters already added.", color, {1, 1, 0.3})
@@ -280,10 +350,7 @@ function addCounters(obj, color, alt_click)
     end
     local desc = self.getDescription() or ""
     local stats = {
-        {name = "Health",    dx = -0.65, dz =  1.0},
-        {name = "Suspicion", dx =  0.65, dz =  1.0},
-        {name = "Mystery",   dx = -0.65, dz = -1.0},
-        {name = "Stability", dx =  0.65, dz = -1.0},
+__MONSTER_STATS_TABLE__
     }
     local basePos = self.getPosition()
     local baseRot = self.getRotation()
@@ -314,9 +381,9 @@ function addCounters(obj, color, alt_click)
     end
 end
 """
-
-RETAINER_COUNTER_SCRIPT = """local COUNTERS_ADDED = false
-
+ 
+RETAINER_COUNTER_SCRIPT_TEMPLATE = """local COUNTERS_ADDED = false
+ 
 function onLoad()
     self.createButton({
         click_function = "addCounters",
@@ -330,7 +397,7 @@ function onLoad()
         font_color = {1, 1, 1},
     })
 end
-
+ 
 function addCounters(obj, color, alt_click)
     if COUNTERS_ADDED then
         broadcastToColor("Counter already added.", color, {1, 1, 0.3})
@@ -341,7 +408,7 @@ function addCounters(obj, color, alt_click)
     if value then
         local basePos = self.getPosition()
         local baseRot = self.getRotation()
-        local pos = {x = basePos.x, y = basePos.y + 0.3, z = basePos.z - 1.0}
+        local pos = {x = basePos.x + __RETAINER_DX__, y = basePos.y + 0.3, z = basePos.z + __RETAINER_DZ__}
         local counter = spawnObject({
             type = "Counter",
             position = pos,
@@ -360,40 +427,56 @@ function addCounters(obj, color, alt_click)
     end
 end
 """
-
-
+ 
+ 
+def _lua_stat_entry(name, dx, dz):
+    return f'        {{name = "{name}", dx = {dx}, dz = {dz}}},'
+ 
+ 
+_monster_stats_table_text = "\n".join(_lua_stat_entry(n, dx, dz) for n, dx, dz in MONSTER_STAT_OFFSETS)
+MONSTER_COUNTER_SCRIPT = MONSTER_COUNTER_SCRIPT_TEMPLATE.replace(
+    "__MONSTER_STATS_TABLE__", _monster_stats_table_text)
+ 
+_retainer_dx, _retainer_dz = RETAINER_STAT_OFFSET
+RETAINER_COUNTER_SCRIPT = (
+    RETAINER_COUNTER_SCRIPT_TEMPLATE
+    .replace("__RETAINER_DX__", str(_retainer_dx))
+    .replace("__RETAINER_DZ__", str(_retainer_dz))
+)
+ 
+ 
 def lua_str(s):
     """Escape a Python string into a Lua double-quoted string literal."""
     s = "" if s is None else str(s)
     s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "\\n")
     return f'"{s}"'
-
-
+ 
+ 
 DECK_BUILDER_SCRIPT_TEMPLATE = """-- Auto-generated by build_tts_deck.py. Paste a decklist into this object's
 -- Notes (right-click > Notes), one card per line, formatted:
 --     3 Meat Feast
 --     2x Clever Management
 --     Careless Researcher        (no count = 1 copy)
 -- Then click the "Build Deck" button. Matching is case-insensitive.
-
+ 
 local DECKS = {
 %(decks)s
 }
-
+ 
 local CARD_DB = {
 %(card_db)s
 }
-
+ 
 -- Shared counter-button scripts (same text used on cards built via the
 -- master library / draft bags) -- see counter_kind() in build_tts_deck.py.
 local MONSTER_COUNTER_SCRIPT = [[
 %(monster_script)s
 ]]
-
+ 
 local RETAINER_COUNTER_SCRIPT = [[
 %(retainer_script)s
 ]]
-
+ 
 function onLoad()
     self.createButton({
         click_function = "buildDeck",
@@ -408,12 +491,12 @@ function onLoad()
         font_color = {1, 1, 1},
     })
 end
-
+ 
 function buildDeck(obj, color, alt_click)
     local text = self.getDescription() or ""
     local spawned = {}
     local notFound = {}
-
+ 
     for line in string.gmatch(text, "[^\\r\\n]+") do
         local count, name = line:match("^%%s*(%%d+)%%s*[xX]?%%s*(.+)$")
         if not count then
@@ -456,11 +539,11 @@ function buildDeck(obj, color, alt_click)
             end
         end
     end
-
+ 
     if #notFound > 0 then
         broadcastToColor("Card(s) not found: " .. table.concat(notFound, ", "), color, {1, 0.3, 0.3})
     end
-
+ 
     if #spawned > 1 then
         Wait.frames(function()
             group(spawned)
@@ -473,8 +556,8 @@ function buildDeck(obj, color, alt_click)
     end
 end
 """
-
-
+ 
+ 
 def build_deck_builder_object(card_lookup, position, example_names):
     """One 'Notecard' object: paste a decklist into its Notes (Description
     field, standard on every TTS object -- no custom UI needed for input),
@@ -489,7 +572,7 @@ def build_deck_builder_object(card_lookup, position, example_names):
         deck_key = int(deck_key_str)
         entry = lookup["CustomDeck"][deck_key_str]
         decks[deck_key] = entry
-
+ 
         row = lookup["row"]
         name_key = normalize_name(row.get("Name", ""))
         kind = counter_kind(row)
@@ -498,7 +581,7 @@ def build_deck_builder_object(card_lookup, position, example_names):
             f'  [{lua_str(name_key)}] = {{CardID={lookup["CardID"]}, Deck={deck_key}, {kind_field}'
             f'Nickname={lua_str(row.get("Name", ""))}, Description={lua_str(card_description(row))}}},'
         )
-
+ 
     deck_lines = []
     for key in sorted(decks):
         e = decks[key]
@@ -508,21 +591,21 @@ def build_deck_builder_object(card_lookup, position, example_names):
             f'BackIsHidden={"true" if e["BackIsHidden"] else "false"}, '
             f'UniqueBack={"true" if e["UniqueBack"] else "false"}, Type=0}},'
         )
-
+ 
     script = DECK_BUILDER_SCRIPT_TEMPLATE % {
         "decks": "\n".join(deck_lines),
         "card_db": "\n".join(card_db_lines),
         "monster_script": MONSTER_COUNTER_SCRIPT,
         "retainer_script": RETAINER_COUNTER_SCRIPT,
     }
-
+ 
     example_text = "\n".join(f"1 {n}" for n in example_names[:3])
     description = (
         "Paste your decklist here, one card per line: '3 Meat Feast' or "
         "'2x Clever Management' or just 'Careless Researcher' for 1 copy. "
         "Then click Build Deck.\n\nExample:\n" + example_text
     )
-
+ 
     obj = {
         "Name": "Notecard",
         "Transform": {
@@ -538,8 +621,8 @@ def build_deck_builder_object(card_lookup, position, example_names):
     }
     print(f"Built deck-builder Notecard with {len(card_db_lines)} cards in its database")
     return obj
-
-
+ 
+ 
 def build_json(all_sheets, backs_dir, output_dir, face_url_base, back_url_base):
     """Builds the master library deck objects (one copy of every card).
     Returns (object_states, card_lookup, x_offset) where card_lookup maps
@@ -551,20 +634,20 @@ def build_json(all_sheets, backs_dir, output_dir, face_url_base, back_url_base):
     x_offset = 0
     deck_counter = 0
     missing_backs = set()
-
+ 
     for sheet in all_sheets:
         deck_counter += 1
         group_key = sheet["group"]
         face_filename = sheet["path"].name
         face_url = (face_url_base.rstrip("/") + "/" + face_filename) if face_url_base else PLACEHOLDER_FACE_URL
-
+ 
         back_path = find_image_by_stem(backs_dir, group_key) if backs_dir else None
         if back_path is not None:
             back_url = (back_url_base.rstrip("/") + "/" + back_path.name) if back_url_base else PLACEHOLDER_BACK_URL
         else:
             back_url = PLACEHOLDER_BACK_URL
             missing_backs.add(group_key)
-
+ 
         custom_deck_key = str(deck_counter)
         custom_deck_entry = {
             "FaceURL": face_url,
@@ -575,7 +658,7 @@ def build_json(all_sheets, backs_dir, output_dir, face_url_base, back_url_base):
             "UniqueBack": False,
             "Type": 0,
         }
-
+ 
         contained = []
         deck_ids = []
         for i, row in enumerate(sheet["rows"]):
@@ -584,7 +667,7 @@ def build_json(all_sheets, backs_dir, output_dir, face_url_base, back_url_base):
             description = card_description(row)
             kind = counter_kind(row)
             script = {"Monster": MONSTER_COUNTER_SCRIPT, "Retainer": RETAINER_COUNTER_SCRIPT}.get(kind, "")
-
+ 
             contained.append({
                 "Name": "Card",
                 "Nickname": row.get("Name", f"Card {row['_num']}"),
@@ -600,13 +683,13 @@ def build_json(all_sheets, backs_dir, output_dir, face_url_base, back_url_base):
                     "scaleX": 1, "scaleY": 1, "scaleZ": 1,
                 },
             })
-
+ 
             card_lookup[row["_num"]] = {
                 "CardID": card_id,
                 "CustomDeck": {custom_deck_key: custom_deck_entry},
                 "row": row,
             }
-
+ 
         deck_object = {
             "Name": "DeckCustom",
             "Transform": {
@@ -621,15 +704,15 @@ def build_json(all_sheets, backs_dir, output_dir, face_url_base, back_url_base):
         }
         object_states.append(deck_object)
         x_offset += 4
-
+ 
     if missing_backs:
         print(f"WARNING: no back image found for group(s): {sorted(missing_backs)}. "
               f"Those decks got a placeholder BackURL -- fix manually or add the "
               f"missing file(s) to --backs-dir and re-run.", file=sys.stderr)
-
+ 
     return object_states, card_lookup, x_offset
-
-
+ 
+ 
 REFILL_SCRIPT = """function onObjectLeaveContainer(container, object)
     if container == self then
         self.putObject(object.clone({
@@ -637,8 +720,8 @@ REFILL_SCRIPT = """function onObjectLeaveContainer(container, object)
         }))
     end
 end"""
-
-
+ 
+ 
 def _refill_card_object(row, lookup):
     kind = counter_kind(row)
     script = {"Monster": MONSTER_COUNTER_SCRIPT, "Retainer": RETAINER_COUNTER_SCRIPT}.get(kind, "")
@@ -657,8 +740,8 @@ def _refill_card_object(row, lookup):
             "scaleX": 1, "scaleY": 1, "scaleZ": 1,
         },
     }
-
-
+ 
+ 
 def build_single_infinite_bag(rows, card_lookup, bag_label, position):
     """One bag holding all unique cards passed in (each a different card),
     with a self-refill script: whenever a card is taken out, a clone of it
@@ -674,11 +757,11 @@ def build_single_infinite_bag(rows, card_lookup, bag_label, position):
             skipped += 1
             continue
         contained.append(_refill_card_object(row, lookup))
-
+ 
     if skipped:
         print(f"WARNING: {skipped} cards in '{bag_label}' had no master "
               f"library entry, skipped when building the infinite bag", file=sys.stderr)
-
+ 
     bag_obj = {
         "Name": "Bag",
         "Transform": {
@@ -695,8 +778,8 @@ def build_single_infinite_bag(rows, card_lookup, bag_label, position):
     }
     print(f"Built infinite bag '{bag_label}' holding {len(contained)} unique cards")
     return bag_obj
-
-
+ 
+ 
 def build_draft_bags(rows, card_lookup):
     """The 5 bags used for pre-game deckbuilding:
       - Monster: every monster card (unfiltered, no faction restriction)
@@ -710,62 +793,63 @@ def build_draft_bags(rows, card_lookup):
     for fac in FACTIONS:
         fac_rows = [r for r in rows if is_expedition(r) and fac in (r.get("Faction") or "")]
         bag_defs.append((f"Faction-{fac}", fac_rows))
-
+ 
     bags = []
     x = 0
     for label, group_rows in bag_defs:
         bags.append(build_single_infinite_bag(group_rows, card_lookup, label, (x, -6)))
         x += 3
     return bags
-
-
+ 
+ 
 def main():
     images_dir = Path(IMAGES_DIR)
     backs_dir = Path(BACKS_DIR)
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
-
+ 
     rows = load_csv(Path(CSV_PATH))
     print(f"Loaded {len(rows)} cards from CSV")
-
+ 
     image_index = build_image_index(images_dir)
     print(f"Indexed {len(image_index)} face images in {images_dir}")
-
+ 
     groups = {}
     for row in rows:
         groups.setdefault(row["_back_group"], []).append(row)
-
+ 
     print("Back groups found:")
     for g, r in sorted(groups.items()):
         print(f"  {g}: {len(r)} cards")
-
+ 
     all_sheets = []
     for group_key, group_rows in groups.items():
         all_sheets.extend(build_face_sheets(group_rows, images_dir, image_index, output_dir, group_key))
-
+ 
     object_states, card_lookup, x_offset = build_json(
         all_sheets, backs_dir, output_dir, FACE_URL_BASE, BACK_URL_BASE)
-
+ 
     if DRAFT_BAGS:
         object_states.extend(build_draft_bags(rows, card_lookup))
-
+ 
     if DECK_BUILDER:
         example_names = [r.get("Name", "") for r in rows[:3]]
         object_states.append(build_deck_builder_object(card_lookup, (10, -6), example_names))
-
+ 
     save = {"SaveName": "Wildward Full Deck", "GameMode": "Wildward", "ObjectStates": object_states}
     out_path = output_dir / "wildward_tts_save.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(save, f, indent=2)
     print(f"Wrote {out_path}")
-
+ 
     print("\nDone. Next steps:")
     print("1. Host all sheet_faces_*.png and your back images somewhere public.")
     print("2. If FACE_URL_BASE/BACK_URL_BASE were blank, open the JSON and")
     print("   replace REPLACE_ME_FACE_SHEET_URL / REPLACE_ME_BACK_URL with real URLs.")
     print("3. Copy the JSON into your TTS 'Saved Objects' folder and load it from")
     print("   Objects > Saved Objects in-game.")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+ 
