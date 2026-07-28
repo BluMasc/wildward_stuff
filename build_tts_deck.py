@@ -315,10 +315,10 @@ def counter_kind(row):
     """Which counter-button script (if any) a card should get, based on
     its type. Only Monster (4 stats) and Retainer (1 Stamina) have real
     trackable per-card values in this game -- other Expedition types don't."""
-    if row.get("_back_group") == "Monster":
-        return "Monster"
-    if (row.get("Type", "") or "") == "Retainer":
-        return "Retainer"
+    #if row.get("_back_group") == "Monster":
+    #    return "Monster"
+    #if (row.get("Type", "") or "") == "Retainer":
+    #    return "Retainer"
     return None
  
  
